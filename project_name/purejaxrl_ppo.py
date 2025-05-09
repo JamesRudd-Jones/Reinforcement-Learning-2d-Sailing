@@ -14,7 +14,10 @@ from wrappers import (
     NormalizeVecObservation,
     NormalizeVecReward,
     ClipAction,
+    NormalisedEnv
 )
+import gymnax
+import jax.random as jrandom
 
 
 class ActorCritic(nn.Module):
@@ -75,12 +78,16 @@ def make_train(config):
     )
     env = SailingEnv()
     env_params = env.default_params
+    # env, env_params = gymnax.make("MountainCarContinuous-v0")
     env = LogWrapper(env)
     # env = ClipAction(env)
     env = VecEnv(env)
+
     if config["NORMALIZE_ENV"]:
-        env = NormalizeVecObservation(env)
-        env = NormalizeVecReward(env, config["GAMMA"])
+        env = NormalisedEnv(env, env_params)
+        # env = NormalizeVecObservation(env)
+        # env = NormalizeVecReward(env, config["GAMMA"])
+        # TODO add this in
 
     def linear_schedule(count):
         frac = (
@@ -118,6 +125,8 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = env.reset(reset_rng, env_params)
+
+        print("HERE")
 
         # TRAIN LOOP
         def _update_step(runner_state, unused):
@@ -289,14 +298,49 @@ def make_train(config):
     return train
 
 
+def make_eval(config, train_state):
+    env = SailingEnv()
+    env_params = env.default_params
+    # env, env_params = gymnax.make("MountainCarContinuous-v0")
+    # env = LogWrapper(env)
+    # env = ClipAction(env)
+
+    if config["NORMALIZE_ENV"]:
+        env = NormalisedEnv(env, env_params)
+        # env = NormalizeVecObservation(env)
+        # env = NormalizeVecReward(env, config["GAMMA"])
+        # TODO add this in
+
+    # INIT NETWORK
+    network = ActorCritic(env.action_space(env_params).shape[0], activation=config["ACTIVATION"])
+    rng = jrandom.key(42)
+    rng, _rng = jax.random.split(rng)
+    obsv, env_state = env.reset(_rng, env_params)
+
+    print("HERE")
+
+    for _ in range(1000):
+        # SELECT ACTION
+        rng, _rng = jax.random.split(rng)
+        pi, value = network.apply(train_state.params, obsv)
+        action = pi.sample(seed=_rng)
+
+        # STEP ENV
+        rng, _rng = jax.random.split(rng)
+        obsv, env_state, reward, done, info = env.step(_rng, env_state, action, env_params)
+
+        env.render(env_state, env_params)
+
+
+
 if __name__ == "__main__":
     config = {
         "LR": 3e-4,
-        "NUM_ENVS": 2048,
-        "NUM_STEPS": 10,
-        "TOTAL_TIMESTEPS": 5e7,
+        "NUM_ENVS": 4,  # 2048,
+        "NUM_STEPS": 16,#0,
+        "TOTAL_TIMESTEPS": 100000,  # 5e7,
         "UPDATE_EPOCHS": 4,
-        "NUM_MINIBATCHES": 32,
+        "NUM_MINIBATCHES": 16,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
         "CLIP_EPS": 0.2,
@@ -306,9 +350,11 @@ if __name__ == "__main__":
         "ACTIVATION": "tanh",
         "ENV_NAME": "hopper",
         "ANNEAL_LR": False,
-        "NORMALIZE_ENV": True,
+        "NORMALIZE_ENV": False,
         "DEBUG": True,
     }
     rng = jax.random.PRNGKey(30)
     train_jit = jax.jit(make_train(config))
-    out = train_jit(rng)
+    out = jax.block_until_ready(train_jit(rng))
+    train_state = out["runner_state"][0]
+    make_eval(config, train_state)

@@ -422,8 +422,8 @@ class EnvState(environment.EnvState):
 class EnvParams(environment.EnvParams):
     max_steps_in_episode: int = 500
     wind_dir: float = 0.0
-    wind_vel: jnp.ndarray = jnp.zeros((2, 1))
-    max_action: float = 1.0
+    wind_vel: jnp.ndarray = jnp.zeros(2)
+    max_action: float = 0.001
     max_heading_vel: float = 1.0
     max_speed: float = 10.0
     acceleration: float = 1.0
@@ -437,6 +437,7 @@ class EnvParams(environment.EnvParams):
     # boat_path_length: int = 30
 
     marks: jnp.ndarray = jnp.array(((400, 500),))
+    # TODO to deal with multiple marks, could jnp.roll once done a conditional
     reward_gate: jnp.ndarray = jnp.array((10, 10))
 
 
@@ -451,7 +452,7 @@ class SailingEnv(environment.Environment[EnvState, EnvParams]):
     def default_params(self) -> EnvParams:
         params = EnvParams()
         params = params.replace(max_heading_vel=300.0 / 360.0 * 2 * jnp.pi * params.dt,    # radians per second
-                                wind_vel=jnp.array(((0.0,), (-50.0,))) * params.dt)
+                                wind_vel=jnp.array((0.0, -50.0)) * params.dt)
         return params
 
     @staticmethod
@@ -481,77 +482,76 @@ class SailingEnv(environment.Environment[EnvState, EnvParams]):
 
     @staticmethod
     def dist_to_mark(state, params):
-        return jnp.sqrt(jnp.square(params.marks[0, 0] - state.boat_pos[0]) + jnp.square(params.marks[0, 1] - state.boat_pos[1]))
+        return params.marks[0] - state.boat_pos[0]
 
     def step_env(self, key: chex.PRNGKey, state: EnvState,  action: Union[int, float, chex.Array], params: EnvParams
                  ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
         # 1. Update boat heading based on action
         action_1 = jnp.clip(action, -params.max_action, params.max_action)
-        speed_11 = jnp.dot(state.boat_vel.T, self.unit_vector(state.boat_dir))
-        sqrtspeed_11 = jax.lax.select(speed_11 > 0,
-                                   jnp.sqrt(jnp.linalg.norm(state.boat_vel, keepdims=True)),
-                                   -jnp.sqrt(jnp.linalg.norm(state.boat_vel, keepdims=True)))
-        sqrtspeed_1 = jnp.squeeze(sqrtspeed_11, axis=-1)
-        new_boat_dir_acc_1 = state.boat_dir_acc * 0.97  # TODO some decel modifier, maybe better way to state it
-        new_boat_dir_acc_1 = jnp.clip(new_boat_dir_acc_1 + action_1 * sqrtspeed_1,
+        speed = jnp.dot(state.boat_vel, self.unit_vector(state.boat_dir))
+        sqrtspeed = jax.lax.select(speed > 0,
+                                   jnp.sqrt(jnp.linalg.norm(state.boat_vel)),
+                                   -jnp.sqrt(jnp.linalg.norm(state.boat_vel)))
+        new_boat_dir_acc = state.boat_dir_acc * 0.97  # TODO some decel modifier, maybe better way to state it
+        new_boat_dir_acc = jnp.clip(new_boat_dir_acc + action_1.squeeze() * sqrtspeed,
                                       -params.max_heading_vel,
                                       params.max_heading_vel)
-        new_heading_1 = state.boat_dir + new_boat_dir_acc_1
-        new_heading_1 = jnp.mod(new_heading_1, 2 * jnp.pi)  # Wrap heading to be within 0 and 2*pi
+        new_heading = state.boat_dir + new_boat_dir_acc
+        new_heading = jnp.mod(new_heading, 2 * jnp.pi)  # Wrap heading to be within 0 and 2*pi
 
-        fcentripetal_1 = new_boat_dir_acc_1 * params.mass
+        fcentripetal = new_boat_dir_acc * params.mass
 
-        unit_heading_21 = self.unit_vector(new_heading_1)
-        unit_perp_21 = self.perpendicular(unit_heading_21)
+        unit_heading_2 = self.unit_vector(new_heading)
+        unit_perp_2 = self.perpendicular(unit_heading_2)
 
         # 2. Calculate the angle between the boat heading and wind direction.
-        angle_diff_1 = self.angle_to_wind(new_heading_1, params)
+        angle_diff = self.angle_to_wind(new_heading, params)
 
         # 3. Calculate the speed multiplier based on the polar curve.
-        speed_multiplier_1 = self.polar_curve(jnp.abs(angle_diff_1))  # TODO assuming polar curve is the same on both tacks
-        apparent_wind_21 = params.wind_vel - state.boat_vel
-        apparent_wind_speed_1 = jnp.squeeze(jnp.linalg.norm(apparent_wind_21, keepdims=True), axis=-1)
+        speed_multiplier = self.polar_curve(jnp.abs(angle_diff))  # TODO assuming polar curve is the same on both tacks
+        apparent_wind_2 = params.wind_vel - state.boat_vel
+        apparent_wind_speed = jnp.linalg.norm(apparent_wind_2)
 
         # 4. Update boat speed, accounting for acceleration/deceleration.
         SAILCOEFF = 7.0
-        fdrive_21 = speed_multiplier_1 * apparent_wind_speed_1 * SAILCOEFF * unit_heading_21
+        fdrive_2 = speed_multiplier * apparent_wind_speed * SAILCOEFF * unit_heading_2
 
-        vforward_21 = jnp.dot(state.boat_vel.T, unit_heading_21) * unit_heading_21
-        vperpendicular_21 = state.boat_vel - vforward_21
+        vforward_2 = jnp.dot(state.boat_vel, unit_heading_2) * unit_heading_2
+        vperpendicular_2 = state.boat_vel - vforward_2
 
-        fdrag_21 = -vforward_21 * jnp.linalg.norm(vforward_21) * 100.0  # opposite to direction of movement
-        fkeel_21 = -vperpendicular_21 * jnp.linalg.norm(vperpendicular_21) * 1200.0
-        fperp_21 = unit_perp_21 * fcentripetal_1 * jnp.linalg.norm(state.boat_vel)
+        fdrag_2 = -vforward_2 * jnp.linalg.norm(vforward_2) * 100.0  # opposite to direction of movement
+        fkeel_2 = -vperpendicular_2 * jnp.linalg.norm(vperpendicular_2) * 1200.0
+        fperp_2 = unit_perp_2 * fcentripetal * jnp.linalg.norm(state.boat_vel)
 
-        new_boat_vel_21 = state.boat_vel + (fdrive_21 + fdrag_21 + fkeel_21 + fperp_21) / params.mass
+        new_boat_vel_2 = state.boat_vel + (fdrive_2 + fdrag_2 + fkeel_2 + fperp_2) / params.mass
 
         # 5. Update boat position based on heading and speed.
-        new_boat_pos_21 = state.boat_pos + new_boat_vel_21 * params.dt
+        new_boat_pos_2 = state.boat_pos + new_boat_vel_2 * params.dt
 
         # 6. Update boat path
         old_path = jnp.roll(state.boat_path, 1, axis=-1)
-        new_boat_path = old_path.at[:, 0].set(jnp.squeeze(new_boat_pos_21, axis=-1))
+        new_boat_path = old_path.at[:, 0].set(new_boat_pos_2)
 
         # Update state dict and evaluate termination conditions
-        state = EnvState(boat_pos=new_boat_pos_21,
-                         boat_dir=new_heading_1,
-                         boat_dir_acc=new_boat_dir_acc_1,
-                         boat_vel=new_boat_vel_21,
+        new_state = EnvState(boat_pos=new_boat_pos_2,
+                         boat_dir=new_heading,
+                         boat_dir_acc=new_boat_dir_acc,
+                         boat_vel=new_boat_vel_2,
                          boat_path=new_boat_path,
                          time=state.time + 1,
                          )
 
-        reward = self.reward_func(state, params)
+        reward = self.reward_func(state, new_state, params)
 
-        done = self.is_terminal(state, params)
+        done = self.is_terminal(new_state, params)
 
         # TODO same calcs are in get obs and reward and done, can we combine?
 
-        return (jax.lax.stop_gradient(self.get_obs(state, params)),
-                jax.lax.stop_gradient(state),
+        return (jax.lax.stop_gradient(self.get_obs(new_state, params)),
+                jax.lax.stop_gradient(new_state),
                 jnp.array(reward),
                 done,
-                {"discount": self.discount(state, params)},
+                {"discount": self.discount(new_state, params)},
         )
 
     @staticmethod
@@ -588,10 +588,10 @@ class SailingEnv(environment.Environment[EnvState, EnvParams]):
         init_dir = jnp.radians(jnp.ones(1,) * 90)
         boat_speed = 1
         init_boat_vel = self.vector_decomp(boat_speed, init_dir)
-        state = EnvState(boat_pos=init_pos,
-                         boat_dir=init_dir,
-                         boat_dir_acc=jnp.zeros(1,),
-                         boat_vel=init_boat_vel,
+        state = EnvState(boat_pos=init_pos.squeeze(axis=-1),
+                         boat_dir=init_dir.squeeze(),
+                         boat_dir_acc=jnp.zeros(1,).squeeze(),
+                         boat_vel=init_boat_vel.squeeze(axis=-1),
                          # boat_path=jnp.repeat(init_pos, params.boat_path_length, axis=1),
                          boat_path=jnp.repeat(init_pos, 40, axis=1),
                          time=0,
@@ -600,7 +600,7 @@ class SailingEnv(environment.Environment[EnvState, EnvParams]):
 
     def get_obs(self, state: EnvState, params=None, key=None) -> chex.Array:
         """Applies observation function to state."""
-        boat_speed = jnp.squeeze(jnp.dot(state.boat_vel.T, self.unit_vector(state.boat_dir)), axis=-1)
+        boat_speed = jnp.dot(state.boat_vel, self.unit_vector(state.boat_dir))
         angle_to_wind = self.angle_to_wind(state.boat_dir, params)
         angle_to_mark = self.angle_to_mark(state, params)
         dist_to_mark = self.dist_to_mark(state, params)
@@ -608,18 +608,35 @@ class SailingEnv(environment.Environment[EnvState, EnvParams]):
                          angle_to_wind,
                          state.boat_dir_acc,
                          angle_to_mark,
-                         dist_to_mark,
+                         jnp.linalg.norm(dist_to_mark),
                         ])
-        return jnp.squeeze(obs, axis=-1)
-        # return jnp.zeros(1,)
+        return obs
 
-    def reward_func(self, state: EnvState, params: EnvParams) -> jnp.ndarray:
-        return - self.dist_to_mark(state, params)
+    def reward_func(self, old_state: EnvState, state: EnvState, params: EnvParams) -> jnp.ndarray:
+        done_x = jax.lax.select(jnp.logical_or(state.boat_pos[0] < 0, state.boat_pos[0] > params.screen_width),
+                                jnp.array(True), jnp.array(False))
+        done_y = jax.lax.select(jnp.logical_or(state.boat_pos[1] < 0, state.boat_pos[1] > params.screen_height),
+                                jnp.array(True), jnp.array(False))
+        done_boundaries = jnp.logical_or(done_x, done_y)
+        done_time = jax.lax.select(state.time >= 3000, jnp.array(True), jnp.array(False))
+        overall_done = jnp.logical_or(done_time, done_boundaries)
+        # reward_dist = -jnp.linalg.norm(self.dist_to_mark(state, params), 8)#  / jnp.sqrt(jnp.square(params.screen_width) + jnp.square(params.screen_height))
+        reward_dist = jnp.linalg.norm(self.dist_to_mark(old_state, params), 8) - jnp.linalg.norm(self.dist_to_mark(state, params), 8)
+        reward = jax.lax.select(overall_done, -100.0, reward_dist)
+        return reward
 
     def is_terminal(self, state: EnvState, params: EnvParams) -> jnp.ndarray:
         # """Check whether state is terminal."""
         dist_to_mark = self.dist_to_mark(state, params)
-        done = jax.lax.select(jnp.squeeze(dist_to_mark <= 1), jnp.array(True), jnp.array(False))
+        done_dist = jax.lax.select(jnp.linalg.norm(dist_to_mark) <= 1, jnp.array(True), jnp.array(False))
+        done_time = jax.lax.select(state.time >= 3000, jnp.array(True), jnp.array(False))
+        done_x = jax.lax.select(jnp.logical_or(state.boat_pos[0] < 0, state.boat_pos[0] > params.screen_width),
+                                jnp.array(True), jnp.array(False))
+        done_y = jax.lax.select(jnp.logical_or(state.boat_pos[1] < 0, state.boat_pos[1] > params.screen_height),
+                                jnp.array(True), jnp.array(False))
+        done_boundaries = jnp.logical_or(done_x, done_y)
+        done_inter = jnp.logical_or(done_dist, done_time)
+        done = jnp.logical_or(done_boundaries, done_inter)
         return done
 
     @property
@@ -639,12 +656,12 @@ class SailingEnv(environment.Environment[EnvState, EnvParams]):
     def observation_space(self, params: EnvParams) -> spaces.Box:
         """Observation space of the environment."""
         max_speed = 2
-        max_dist = 1000
+        max_dist = jnp.sqrt(jnp.square(params.screen_width) + jnp.square(params.screen_height))
         max_accel = 2.0
         # TODO sort out the above to be a bit better
         low = jnp.array([0.0,
                          -jnp.pi,
-                         0.0
+                         0.0,
                          -jnp.pi,
                          0.0,
                          ])
@@ -678,7 +695,7 @@ class SailingEnv(environment.Environment[EnvState, EnvParams]):
             return int(x), int(flip_y)
 
         # Draw Boat Path
-        path_length = params.boat_path_length
+        path_length = 30
         for i in range(path_length):
             p = state.boat_path[:, i]
             x, y = to_screen_coords(p[0], p[1])
@@ -687,7 +704,7 @@ class SailingEnv(environment.Environment[EnvState, EnvParams]):
 
         # Draw Boat
         boat_angle = jnp.squeeze(state.boat_dir)
-        boat_x_screen, boat_y_screen = to_screen_coords(state.boat_pos[0, 0], state.boat_pos[1, 0])
+        boat_x_screen, boat_y_screen = to_screen_coords(state.boat_pos[0], state.boat_pos[1])
 
         # Load and rotate the boat image.
         boat_image_path = "./boaty_boat.png"
@@ -748,7 +765,7 @@ class SailingEnv(environment.Environment[EnvState, EnvParams]):
         screen.blit(time_text, (10, 40))
 
         # Draw Position Text
-        pos_text = font.render(f"Position: ({state.boat_pos[0, 0]:.2f}, {state.boat_pos[1, 0]:.2f})", True, (0, 0, 0))
+        pos_text = font.render(f"Position: ({state.boat_pos[0]:.2f}, {state.boat_pos[1]:.2f})", True, (0, 0, 0))
         screen.blit(pos_text, (10, 70))
 
         pygame.display.flip()
@@ -757,7 +774,7 @@ class SailingEnv(environment.Environment[EnvState, EnvParams]):
 
 
 if __name__ == '__main__':
-    with jax.disable_jit(disable=True):
+    with jax.disable_jit(disable=False):
         key = jrandom.PRNGKey(42)
 
         # Instantiate the environment & its settings.
@@ -768,8 +785,9 @@ if __name__ == '__main__':
         key, _key = jrandom.split(key)
         obs, state = env.reset(_key, env_params)
 
-        time_steps = 500
+        time_steps = 3000  # 500
         # start_time = time.time()
+        returns = 0
         for _ in range(time_steps):
             # Sample a random action.
             key, _key = jrandom.split(key)
@@ -783,4 +801,7 @@ if __name__ == '__main__':
             # Perform the step transition.
             key, _key = jrandom.split(key)
             obs, state, reward, done, _ = env.step(_key, state, action, env_params)
+            returns += reward
+            print(returns)
         # print(time.time() - start_time)
+
